@@ -16,7 +16,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -29,7 +31,16 @@ func Add(mgr manager.Manager, _ string) error {
 func (r *ReconcileNode) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Node{}).
+		WithEventFilter(nodeDeletionPredicate(r)).
 		Complete(r)
+}
+func nodeDeletionPredicate(controller *ReconcileNode) predicate.Predicate {
+	return predicate.Funcs{
+		DeleteFunc: func(deleteEvent event.DeleteEvent) bool {
+			controller.reconcileNodeDeletion(deleteEvent.Object.GetName())
+			return false
+		},
+	}
 }
 
 // blank assignment to verify that ReconcileNode implements reconcile.Reconciler
@@ -41,6 +52,8 @@ func NewReconciler(mgr manager.Manager) *ReconcileNode {
 		client:       mgr.GetClient(),
 		scheme:       mgr.GetScheme(),
 		dtClientFunc: dynakube.BuildDynatraceClient,
+		runLocal:     os.Getenv("RUN_LOCAL") == "true",
+		podNamespace: os.Getenv("POD_NAMESPACE"),
 	}
 }
 
@@ -48,11 +61,19 @@ type ReconcileNode struct {
 	client       client.Client
 	scheme       *runtime.Scheme
 	dtClientFunc dynakube.DynatraceClientFunc
+	runLocal     bool
+	podNamespace string
+}
+
+type CachedNodeInfo struct {
+	cachedNode CacheEntry
+	nodeCache  *Cache
+	nodeName   string
 }
 
 func (r *ReconcileNode) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	nodeName := request.NamespacedName.Name
-	dk, err := r.determineDynakubeForNode(nodeName)
+	dynakube, err := r.determineDynakubeForNode(nodeName)
 	if err != nil {
 		log.Error(err, "error while getting Dynakube for Node")
 		return reconcile.Result{}, err
@@ -67,20 +88,6 @@ func (r *ReconcileNode) Reconcile(ctx context.Context, request reconcile.Request
 	if err := r.client.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
 		// handle deletion of Node
 		if k8serrors.IsNotFound(err) {
-			if dk != nil && nodeCache.ContainsKey(nodeName) {
-				cachedNode, err := nodeCache.Get(nodeName)
-				if err != nil {
-					return reconcile.Result{}, err
-				}
-
-				// Only mark for termination if ipAddress is set and Node was seen last less than an hour ago
-				if !r.isNodeDeleteable(cachedNode) {
-					if err := r.markForTermination(dk, nodeCache, cachedNode, nodeName); err != nil {
-						return reconcile.Result{}, err
-					}
-				}
-				r.removeNodeFromCache(nodeCache, cachedNode, nodeName)
-			}
 			log.Info("node was not found in cluster", "node", nodeName)
 			return reconcile.Result{}, nil
 		}
@@ -88,27 +95,31 @@ func (r *ReconcileNode) Reconcile(ctx context.Context, request reconcile.Request
 	}
 
 	// Node is found in the cluster, add or update to cache
-	if dk != nil {
-		var ipAddress = dk.Status.OneAgent.Instances[nodeName].IPAddress
-		info := CacheEntry{
-			Instance:  dk.Name,
+	if dynakube != nil {
+		var ipAddress = dynakube.Status.OneAgent.Instances[nodeName].IPAddress
+		cacheEntry := CacheEntry{
+			Instance:  dynakube.Name,
 			IPAddress: ipAddress,
 			LastSeen:  time.Now().UTC(),
 		}
 
 		if cached, err := nodeCache.Get(nodeName); err == nil {
-			info.LastMarkedForTermination = cached.LastMarkedForTermination
+			cacheEntry.LastMarkedForTermination = cached.LastMarkedForTermination
 		}
 
-		if err := nodeCache.Set(nodeName, info); err != nil {
+		if err := nodeCache.Set(nodeName, cacheEntry); err != nil {
 			return reconcile.Result{}, err
 		}
 
 		//Handle unschedulable Nodes, if they have a OneAgent instance
 		if r.isUnschedulable(&node) {
-			err := r.markForTermination(dk, nodeCache, info, nodeName)
+			cachedNodeData := CachedNodeInfo{
+				cachedNode: cacheEntry,
+				nodeCache:  nodeCache,
+				nodeName:   nodeName,
+			}
 
-			if err != nil {
+			if err := r.markForTermination(dynakube, cachedNodeData); err != nil {
 				log.Error(err, "unschedulable node failed to mark for termination", "node", nodeName)
 				return reconcile.Result{}, err
 			}
@@ -125,12 +136,54 @@ func (r *ReconcileNode) Reconcile(ctx context.Context, request reconcile.Request
 	return reconcile.Result{}, r.updateCache(nodeCache, ctx)
 }
 
+func (r *ReconcileNode) reconcileNodeDeletion(nodeName string) error {
+	nodeCache, err := r.getCache()
+	if err != nil {
+		return err
+	}
+
+	dynakube, err := r.determineDynakubeForNode(nodeName)
+	if err != nil {
+		log.Error(err, "error while getting Dynakube for Node")
+	}
+
+	cachedNodeInfo, err := nodeCache.Get(nodeName)
+	if err != nil {
+		if err == ErrNotFound {
+			// uncached node -> igonoring
+			log.Error(err, "ignoring uncached node onDeletion", "node", nodeName)
+			return nil
+		}
+		log.Error(err, "error while getting cachedNode on deletion")
+		return err
+	}
+
+	// Node is found in the cluster and in cache, send mark for termination, not found node is handled in err check
+	if dynakube != nil {
+		cachedNodeData := CachedNodeInfo{
+			cachedNode: cachedNodeInfo,
+			nodeCache:  nodeCache,
+			nodeName:   nodeName,
+		}
+
+		if err := r.markForTermination(dynakube, cachedNodeData); err != nil {
+			log.Error(err, "error while sending mark for termination for node:", "node", nodeName)
+			return err
+		}
+	}
+
+	nodeCache.Delete(nodeName)
+	if err := r.updateCache(nodeCache, context.TODO()); err != nil {
+		log.Error(err, "error while updating node cache after deletion:", "node", nodeName)
+		return err
+	}
+	return nil
+}
+
 func (r *ReconcileNode) getCache() (*Cache, error) {
 	var cm corev1.ConfigMap
-	namespace := os.Getenv("POD_NAMESPACE")
-	podName := os.Getenv("POD_NAME")
 
-	err := r.client.Get(context.TODO(), client.ObjectKey{Name: cacheName, Namespace: namespace}, &cm)
+	err := r.client.Get(context.TODO(), client.ObjectKey{Name: cacheName, Namespace: r.podNamespace}, &cm)
 	if err == nil {
 		return &Cache{Obj: &cm}, nil
 	}
@@ -139,13 +192,13 @@ func (r *ReconcileNode) getCache() (*Cache, error) {
 		cm := &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      cacheName,
-				Namespace: namespace,
+				Namespace: r.podNamespace,
 			},
 			Data: map[string]string{},
 		}
 
-		if os.Getenv("RUN_LOCAL") != "true" { // If running locally, don't set the controller.
-			deploy, err := kubeobjects.GetDeployment(r.client, podName, namespace)
+		if !r.runLocal { // If running locally, don't set the controller.
+			deploy, err := kubeobjects.GetDeployment(r.client, os.Getenv("POD_NAME"), r.podNamespace)
 			if err != nil {
 				return nil, err
 			}
@@ -213,8 +266,8 @@ func (r *ReconcileNode) isNodeDeleteable(cachedNode CacheEntry) bool {
 	return false
 }
 
-func (r *ReconcileNode) sendMarkedForTermination(dk *dynatracev1beta1.DynaKube, cachedNode CacheEntry) error {
-	dtp, err := dynakube.NewDynatraceClientProperties(context.TODO(), r.client, *dk)
+func (r *ReconcileNode) sendMarkedForTermination(dynakubeInstance *dynatracev1beta1.DynaKube, cachedNode CacheEntry) error {
+	dtp, err := dynakube.NewDynatraceClientProperties(context.TODO(), r.client, *dynakubeInstance)
 	if err != nil {
 		log.Error(err, err.Error())
 	}
@@ -227,7 +280,7 @@ func (r *ReconcileNode) sendMarkedForTermination(dk *dynatracev1beta1.DynaKube, 
 	entityID, err := dtc.GetEntityIDForIP(cachedNode.IPAddress)
 	if err != nil {
 		log.Info("failed to send mark for termination event",
-			"reason", "failed to determine entity id", "dynakube", dk.Name, "nodeIP", cachedNode.IPAddress, "cause", err)
+			"reason", "failed to determine entity id", "dynakube", dynakubeInstance.Name, "nodeIP", cachedNode.IPAddress, "cause", err)
 
 		return err
 	}
@@ -245,19 +298,19 @@ func (r *ReconcileNode) sendMarkedForTermination(dk *dynatracev1beta1.DynaKube, 
 	})
 }
 
-func (r *ReconcileNode) markForTermination(dk *dynatracev1beta1.DynaKube, nodeCache *Cache, cachedNode CacheEntry, nodeName string) error {
-	if !r.isMarkableForTermination(&cachedNode) {
+func (r *ReconcileNode) markForTermination(dynakube *dynatracev1beta1.DynaKube, cachedNodeData CachedNodeInfo) error {
+	if !r.isMarkableForTermination(&cachedNodeData.cachedNode) {
 		return nil
 	}
 
-	if err := nodeCache.updateLastMarkedForTerminationTimestamp(cachedNode, nodeName); err != nil {
+	if err := cachedNodeData.nodeCache.updateLastMarkedForTerminationTimestamp(cachedNodeData.cachedNode, cachedNodeData.nodeName); err != nil {
 		return err
 	}
 
-	log.Info("sending mark for termination event to dynatrace server", "dynakube", dk.Name, "ip", cachedNode.IPAddress,
-		"node", nodeName)
+	log.Info("sending mark for termination event to dynatrace server", "dynakube", dynakube.Name, "ip", cachedNodeData.cachedNode.IPAddress,
+		"node", cachedNodeData.nodeName)
 
-	return r.sendMarkedForTermination(dk, cachedNode)
+	return r.sendMarkedForTermination(dynakube, cachedNodeData.cachedNode)
 }
 
 func (r *ReconcileNode) isUnschedulable(node *corev1.Node) bool {

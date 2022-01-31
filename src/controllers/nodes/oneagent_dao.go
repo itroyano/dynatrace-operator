@@ -2,7 +2,6 @@ package nodes
 
 import (
 	"context"
-	"os"
 
 	dynatracev1beta1 "github.com/Dynatrace/dynatrace-operator/src/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -17,9 +16,8 @@ func (r *ReconcileNode) determineDynakubeForNode(nodeName string) (*dynatracev1b
 }
 
 func (r *ReconcileNode) getDynakubeList() (*dynatracev1beta1.DynaKubeList, error) {
-	watchNamespace := os.Getenv("POD_NAMESPACE")
 	var dynakubeList dynatracev1beta1.DynaKubeList
-	err := r.client.List(context.TODO(), &dynakubeList, client.InNamespace(watchNamespace))
+	err := r.client.List(context.TODO(), &dynakubeList, client.InNamespace(r.podNamespace))
 	if err != nil {
 		return nil, err
 	}
