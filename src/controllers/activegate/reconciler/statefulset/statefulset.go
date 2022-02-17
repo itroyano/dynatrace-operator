@@ -11,6 +11,7 @@ import (
 	"github.com/Dynatrace/dynatrace-operator/src/controllers/dynakube/activegate"
 	"github.com/Dynatrace/dynatrace-operator/src/deploymentmetadata"
 	"github.com/Dynatrace/dynatrace-operator/src/kubeobjects"
+	"github.com/Dynatrace/dynatrace-operator/src/kubeobjects/address_of"
 	"github.com/pkg/errors"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -23,8 +24,9 @@ const (
 	serviceAccountPrefix   = "dynatrace-"
 	tenantSecretVolumeName = "ag-tenant-secret"
 
-	annotationVersion         = dynatracev1beta1.InternalFlagPrefix + "version"
-	annotationCustomPropsHash = dynatracev1beta1.InternalFlagPrefix + "custom-properties-hash"
+	annotationVersion                     = dynatracev1beta1.InternalFlagPrefix + "version"
+	annotationCustomPropsHash             = dynatracev1beta1.InternalFlagPrefix + "custom-properties-hash"
+	annotationActiveGateContainerAppArmor = "container.apparmor.security.beta.kubernetes.io/" + capability.ActiveGateContainerName
 
 	dtServer             = "DT_SERVER"
 	dtTenant             = "DT_TENANT"
@@ -35,7 +37,6 @@ const (
 	dtGroup              = "DT_GROUP"
 	dtDeploymentMetadata = "DT_DEPLOYMENT_METADATA"
 
-	activeGateConfigDir             = "/var/lib/dynatrace/gateway/config"
 	dataSourceStartupArgsMountPoint = "/mnt/dsexecargs"
 	dataSourceAuthTokenMountPoint   = "/var/lib/dynatrace/remotepluginmodule/agent/runtime/datasources"
 	dataSourceMetadataMountPoint    = "/mnt/dsmetadata"
@@ -103,6 +104,10 @@ func CreateStatefulSet(stsProperties *statefulSetProperties) (*appsv1.StatefulSe
 				Spec: buildTemplateSpec(stsProperties),
 			},
 		}}
+
+	if stsProperties.DynaKube.FeatureAgAppArmor() {
+		sts.Spec.Template.ObjectMeta.Annotations[annotationActiveGateContainerAppArmor] = "runtime/default"
+	}
 
 	for _, onAfterCreateListener := range stsProperties.OnAfterCreateListener {
 		onAfterCreateListener(sts)
@@ -179,6 +184,11 @@ func buildContainers(stsProperties *statefulSetProperties, extraContainerBuilder
 }
 
 func buildActiveGateContainer(stsProperties *statefulSetProperties) corev1.Container {
+	readOnlyFs := false
+	if stsProperties.FeatureAgReadOnlyFilesystem() {
+		readOnlyFs = true
+	}
+
 	return corev1.Container{
 		Name:            capability.ActiveGateContainerName,
 		Image:           stsProperties.DynaKube.ActiveGateImage(),
@@ -197,6 +207,20 @@ func buildActiveGateContainer(stsProperties *statefulSetProperties) corev1.Conta
 			InitialDelaySeconds: 90,
 			PeriodSeconds:       15,
 			FailureThreshold:    3,
+		},
+		SecurityContext: &corev1.SecurityContext{
+			Privileged:               address_of.Bool(false),
+			AllowPrivilegeEscalation: address_of.Bool(false),
+			ReadOnlyRootFilesystem:   &readOnlyFs,
+			RunAsNonRoot:             address_of.Bool(true),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{
+					"all",
+				},
+			},
+			SeccompProfile: &corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			},
 		},
 	}
 }
@@ -240,6 +264,44 @@ func buildVolumes(stsProperties *statefulSetProperties, extraContainerBuilders [
 		volumes = append(volumes, buildProxyVolumes()...)
 	}
 
+	volumes = append(volumes, buildActiveGateVolumes()...)
+
+	return volumes
+}
+
+func buildActiveGateVolumes() []corev1.Volume {
+	volumes := []corev1.Volume{
+		{
+			Name: capability.ActiveGateVolumeNameGatewayConfig,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: capability.ActiveGateVolumeNameGatewayTemp,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: capability.ActiveGateVolumeNameGatewayData,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: capability.ActiveGateVolumeNameLog,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+		{
+			Name: capability.ActiveGateVolumeNameTmp,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+	}
 	return volumes
 }
 
@@ -277,7 +339,6 @@ func buildVolumeMounts(stsProperties *statefulSetProperties) []corev1.VolumeMoun
 
 	if stsProperties.NeedsStatsd() {
 		volumeMounts = append(volumeMounts,
-			corev1.VolumeMount{Name: eecAuthToken, MountPath: activeGateConfigDir},
 			corev1.VolumeMount{Name: eecLogs, MountPath: extensionsLogsDir + "/eec", ReadOnly: true},
 			corev1.VolumeMount{Name: dataSourceStatsdLogs, MountPath: extensionsLogsDir + "/statsd", ReadOnly: true},
 		)
@@ -297,6 +358,39 @@ func buildVolumeMounts(stsProperties *statefulSetProperties) []corev1.VolumeMoun
 	},
 	)
 
+	volumeMounts = append(volumeMounts, buildActiveGateVolumeMounts()...)
+
+	return volumeMounts
+}
+
+func buildActiveGateVolumeMounts() []corev1.VolumeMount {
+	volumeMounts := []corev1.VolumeMount{
+		{
+			ReadOnly:  false,
+			Name:      capability.ActiveGateVolumeNameGatewayConfig,
+			MountPath: capability.ActiveGateDirectoryGatewayConfig,
+		},
+		{
+			ReadOnly:  false,
+			Name:      capability.ActiveGateVolumeNameGatewayTemp,
+			MountPath: capability.ActiveGateDirectoryGatewayTemp,
+		},
+		{
+			ReadOnly:  false,
+			Name:      capability.ActiveGateVolumeNameGatewayData,
+			MountPath: capability.ActiveGateDirectoryGatewayData,
+		},
+		{
+			ReadOnly:  false,
+			Name:      capability.ActiveGateVolumeNameLog,
+			MountPath: capability.ActiveGateDirectoryLog,
+		},
+		{
+			ReadOnly:  false,
+			Name:      capability.ActiveGateVolumeNameTmp,
+			MountPath: capability.ActiveGateDirectoryTmp,
+		},
+	}
 	return volumeMounts
 }
 

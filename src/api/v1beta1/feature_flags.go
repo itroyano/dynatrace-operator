@@ -39,6 +39,8 @@ const (
 	annotationFeatureCustomEecImage                   = annotationFeaturePrefix + "custom-eec-image"
 	annotationFeatureCustomStatsdImage                = annotationFeaturePrefix + "custom-statsd-image"
 	AnnotationFeatureDisableReadOnlyOneAgent          = annotationFeaturePrefix + "disable-oneagent-readonly-host-fs"
+	AnnotationFeatureAgReadOnlyFilesystem             = annotationFeaturePrefix + "activegate-readonly-fs"
+	AnnotationFeatureAgAppArmor                       = annotationFeaturePrefix + "activegate-apparmor"
 )
 
 var (
@@ -144,4 +146,14 @@ func (dk *DynaKube) FeatureCustomStatsdImage() string {
 // Defaults to false
 func (dk *DynaKube) FeatureDisableReadOnlyOneAgent() bool {
 	return dk.Annotations[AnnotationFeatureDisableReadOnlyOneAgent] == "true"
+}
+
+// FeatureAgReadOnlyFilesystem is a feature flag to enable RO mounted filesystem in ActiveGate container
+func (dk *DynaKube) FeatureAgReadOnlyFilesystem() bool {
+	return dk.Annotations[AnnotationFeatureAgReadOnlyFilesystem] == "true"
+}
+
+// FeatureAgAppArmor is a feature flag to enable AppArmor in ActiveGate container
+func (dk *DynaKube) FeatureAgAppArmor() bool {
+	return dk.Annotations[AnnotationFeatureAgAppArmor] == "true"
 }
