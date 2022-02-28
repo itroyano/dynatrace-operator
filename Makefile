@@ -103,6 +103,10 @@ deploy-local-easy: export TAG=snapshot-$(shell git branch --show-current | sed "
 deploy-local-easy:
 	./build/deploy_local.sh
 
+kuttl: deploy
+	#kubectl kuttl test --config ./tests/sanity/testsuite.yaml
+	kubectl kuttl test --config ./tests/activegate/testsuite.yaml
+
 # Generate manifests e.g. CRD, RBAC etc.
 manifests: controller-gen kustomize
 	$(CONTROLLER_GEN) $(CRD_OPTIONS) paths="./..." output:crd:artifacts:config=config/crd/bases

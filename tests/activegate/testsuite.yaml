@@ -1,0 +1,20 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestSuite
+startKIND: true
+kindConfig: tests/config/kind-config.yaml
+kindContainers:
+  - quay.io/dynatrace/dynatrace-operator:snapshot-feature-statsd-ingest--edge
+
+#commands:
+#  - command: kubectl create ns dynatrace
+#  - command: kubectl apply -f ./tests/_build/manifests/01-dynatrace-platform-operator.yaml
+#  - command: kubectl wait --timeout=5m --for=condition=available deployment dynatrace-platform-operator-controller-manager -n dynatrace-platform-operator-system
+#  - command: sleep 5s
+
+namespace: dynatrace
+crdDir: tests/config/crd
+
+testDirs:
+  - tests/activegate
+
+timeout: 60
