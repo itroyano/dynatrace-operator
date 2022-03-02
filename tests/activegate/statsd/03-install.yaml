@@ -8,8 +8,8 @@ spec:
   apiUrl: https://xnl32808.dev.dynatracelabs.com/api
   activeGate:
     capabilities:
-      - metrics-ingest
-#      - statsd-ingest
+#      - metrics-ingest
+      - statsd-ingest
 
   oneAgent:
     applicationMonitoring: {}
